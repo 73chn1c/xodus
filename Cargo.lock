@@ -6776,6 +6776,7 @@ dependencies = [
  "log",
  "msixvc",
  "nix",
+ "quick-xml",
  "reqwest 0.13.4",
  "rustix",
  "serde",
