@@ -55,11 +55,14 @@ pub async fn run(
     };
     println!();
     for file in files {
-        let url = format!(
-            "{}{}",
-            file.cdn_root_paths.first().unwrap(),
-            file.relative_url
-        );
+        let Some(cdn_root) = file.cdn_root_paths.first() else {
+            eprintln!(
+                "'{}' has no CDN root paths to download from",
+                file.file_name
+            );
+            return ExitCode::FAILURE;
+        };
+        let url = format!("{cdn_root}{}", file.relative_url);
         if dry_run {
             println!("{}", url);
             return ExitCode::SUCCESS;
@@ -70,23 +73,49 @@ pub async fn run(
             .progress_chars("#>-")
         );
 
-        let res = client
+        let res = match client
             .get(url)
             .send()
             .await
-            .expect("Failed to request the download");
-        let mut file = tokio::fs::OpenOptions::new()
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(res) => res,
+            Err(err) => {
+                eprintln!("Failed to request '{}': {err}", file.file_name);
+                return ExitCode::FAILURE;
+            }
+        };
+        let mut out_file = match tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
-            .open(file.file_name)
+            .open(&file.file_name)
             .await
-            .unwrap();
+        {
+            Ok(out_file) => out_file,
+            Err(err) => {
+                eprintln!("Could not open '{}' for writing: {err}", file.file_name);
+                return ExitCode::FAILURE;
+            }
+        };
         let mut stream = res.bytes_stream();
 
         while let Some(chunk) = stream.next().await {
-            let chk = chunk.expect("Failed to stream file");
-            file.write_all(&chk).await.expect("Failed to write to file");
+            let chk = match chunk {
+                Ok(chk) => chk,
+                Err(err) => {
+                    eprintln!("Download of '{}' interrupted: {err}", file.file_name);
+                    drop(out_file);
+                    let _ = tokio::fs::remove_file(&file.file_name).await;
+                    return ExitCode::FAILURE;
+                }
+            };
+            if let Err(err) = out_file.write_all(&chk).await {
+                eprintln!("Failed to write '{}' to disk: {err}", file.file_name);
+                drop(out_file);
+                let _ = tokio::fs::remove_file(&file.file_name).await;
+                return ExitCode::FAILURE;
+            }
             progress_bar.inc(chk.len() as u64);
         }
 
