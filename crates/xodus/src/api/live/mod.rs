@@ -35,7 +35,8 @@ pub async fn login_device_credential(
         .header("Host", "login.live.com")
         .body(data)
         .send()
-        .await?;
+        .await?
+        .error_for_status()?;
     let text = response.text().await?;
     let resp: DeviceAddResponse = quick_xml::de::from_str(&text)?;
     Ok(resp)

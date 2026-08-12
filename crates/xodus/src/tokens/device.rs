@@ -25,6 +25,8 @@ pub enum DeviceCredentialError {
     MissingKeyInfo,
     #[error("failed to persist device credentials: {0}")]
     Storage(#[from] TokenStoreError),
+    #[error("unexpected device authentication response: {0:?}")]
+    UnexpectedAuthResponse(BodyContent),
 }
 
 /// Provisions a device (if none is stored yet) or re-authenticates an existing one
@@ -34,7 +36,8 @@ pub async fn ensure_device_credentials(
     tokens: &TokenManager,
 ) -> Result<(), DeviceCredentialError> {
     match tokens.get_device_license() {
-        Err(_) => provision_device(client, tokens).await,
+        Err(TokenStoreError::NotFound) => provision_device(client, tokens).await,
+        Err(err) => Err(DeviceCredentialError::Storage(err)),
         Ok(license) if tokens.get_device_sts_token().is_err() => {
             reauthenticate_device(client, tokens, license).await
         }
@@ -87,10 +90,10 @@ async fn reauthenticate_device(
     let private_key = parse_bcrypt_rsa_private(&key)?;
     let resp = crate::api::live::authenticate_device(client, license.username, private_key).await?;
 
-    if let BodyContent::RequestSecurityTokenResponse(resp) = resp.body.body {
-        save_device_sts_token(tokens, resp)?;
+    match resp.body.body {
+        BodyContent::RequestSecurityTokenResponse(resp) => save_device_sts_token(tokens, resp),
+        other => Err(DeviceCredentialError::UnexpectedAuthResponse(other)),
     }
-    Ok(())
 }
 
 fn save_device_sts_token(
@@ -137,5 +140,30 @@ mod tests {
             .expect_err("garbage splicense should not parse");
 
         assert!(matches!(err, DeviceCredentialError::LicenseParse(_)));
+    }
+
+    #[tokio::test]
+    async fn a_transient_storage_error_reading_the_device_license_is_not_treated_as_missing() {
+        use crate::tokens::backend::MemoryBackend;
+        use crate::tokens::store::TokenBackend;
+
+        let persistent = std::sync::Arc::new(MemoryBackend::default());
+        // Corrupt, non-JSON bytes: get_device_license() will hit a Serde error,
+        // not TokenStoreError::NotFound. This must NOT be treated the same as
+        // "no device license yet" - that would attempt to provision a brand new
+        // device over the network on every transient storage hiccup, which can
+        // burn through the account's device registration limit.
+        persistent.set("dev_license", b"not valid json").unwrap();
+        let tokens = TokenManager::new(persistent, std::sync::Arc::new(MemoryBackend::default()));
+
+        let client = reqwest::Client::new();
+        let err = ensure_device_credentials(&client, &tokens)
+            .await
+            .expect_err("corrupt stored license should not be silently treated as absent");
+
+        assert!(matches!(
+            err,
+            DeviceCredentialError::Storage(TokenStoreError::Serde(_))
+        ));
     }
 }
