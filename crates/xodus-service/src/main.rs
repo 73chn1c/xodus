@@ -17,7 +17,12 @@ const PROTO_MAGIC: u32 = 0x58445350;
 async fn main() {
     xodus::secrets::init_secrets().expect("Failed to init keychain");
     let tokens = Arc::new(TokenManager::with_keychain_and_memory());
-    xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
+    if let Err(err) =
+        xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await
+    {
+        eprintln!("Failed to set up device credentials: {err}");
+        std::process::exit(1);
+    }
     let xodus::models::secrets::Token::Legacy(device_token) =
         tokens.get_device_sts_token().unwrap()
     else {

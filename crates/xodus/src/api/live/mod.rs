@@ -7,7 +7,7 @@ use crate::models::live::ExchangeUserTokenOutcome;
 use crate::models::secrets::{LegacyToken, Token};
 use crate::models::soap;
 
-mod rst;
+pub(crate) mod rst;
 mod utils;
 
 pub const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
@@ -142,7 +142,7 @@ mod test {
         let client = reqwest::Client::new();
 
         let mgr = TokenManager::with_memory();
-        ensure_device_credentials(&client, &mgr).await;
+        ensure_device_credentials(&client, &mgr).await.unwrap();
 
         let token: Token = mgr.get_device_sts_token().unwrap();
         let Token::Legacy(token) = token else {
