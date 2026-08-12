@@ -122,7 +122,10 @@ async fn main() -> ExitCode {
 
     xodus::secrets::init_secrets().expect("Unable to initialize credentials");
     let tokens = TokenManager::with_keychain_and_memory();
-    xodus::tokens::device::ensure_device_credentials(&client, &tokens).await;
+    if let Err(err) = xodus::tokens::device::ensure_device_credentials(&client, &tokens).await {
+        eprintln!("Failed to set up device credentials: {err}");
+        return ExitCode::FAILURE;
+    }
 
     let code = match args.command {
         SubCommand::Download {

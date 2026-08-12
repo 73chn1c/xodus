@@ -1,5 +1,6 @@
 use std::fs::Permissions;
 use std::os::unix::fs::PermissionsExt;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use tokio::net::UnixListener;
@@ -14,10 +15,15 @@ const XML_MAGIC: u32 = 0x58445358;
 const PROTO_MAGIC: u32 = 0x58445350;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     xodus::secrets::init_secrets().expect("Failed to init keychain");
     let tokens = Arc::new(TokenManager::with_keychain_and_memory());
-    xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
+    if let Err(err) =
+        xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await
+    {
+        eprintln!("Failed to set up device credentials: {err}");
+        return ExitCode::FAILURE;
+    }
     let xodus::models::secrets::Token::Legacy(device_token) =
         tokens.get_device_sts_token().unwrap()
     else {
@@ -57,4 +63,5 @@ async fn main() {
     }
 
     _ = tokio::fs::remove_file(socket_path).await;
+    ExitCode::SUCCESS
 }
