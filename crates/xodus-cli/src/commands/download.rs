@@ -73,21 +73,26 @@ pub async fn run(
             .progress_chars("#>-")
         );
 
-        let res = match client.get(url).send().await {
+        let res = match client
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
             Ok(res) => res,
             Err(err) => {
                 eprintln!("Failed to request '{}': {err}", file.file_name);
                 return ExitCode::FAILURE;
             }
         };
-        let mut file = match tokio::fs::OpenOptions::new()
+        let mut out_file = match tokio::fs::OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&file.file_name)
             .await
         {
-            Ok(file) => file,
+            Ok(out_file) => out_file,
             Err(err) => {
                 eprintln!("Could not open '{}' for writing: {err}", file.file_name);
                 return ExitCode::FAILURE;
@@ -99,12 +104,16 @@ pub async fn run(
             let chk = match chunk {
                 Ok(chk) => chk,
                 Err(err) => {
-                    eprintln!("Download interrupted: {err}");
+                    eprintln!("Download of '{}' interrupted: {err}", file.file_name);
+                    drop(out_file);
+                    let _ = tokio::fs::remove_file(&file.file_name).await;
                     return ExitCode::FAILURE;
                 }
             };
-            if let Err(err) = file.write_all(&chk).await {
-                eprintln!("Failed to write to disk: {err}");
+            if let Err(err) = out_file.write_all(&chk).await {
+                eprintln!("Failed to write '{}' to disk: {err}", file.file_name);
+                drop(out_file);
+                let _ = tokio::fs::remove_file(&file.file_name).await;
                 return ExitCode::FAILURE;
             }
             progress_bar.inc(chk.len() as u64);
