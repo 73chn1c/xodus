@@ -123,31 +123,68 @@ pub async fn run(
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
     let out: &Path = Path::new(&source);
-    let out_absolute = std::fs::canonicalize(out).unwrap();
+    let out_absolute = match tokio::fs::canonicalize(out).await {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("Could not resolve '{source}': {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let final_path = out.join(".xodus-streaming.msixvc");
 
-    let mut file = OpenOptions::new()
-        .read(true)
-        .open(final_path.to_owned())
-        .await
-        .unwrap();
+    let mut file = match OpenOptions::new().read(true).open(&final_path).await {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!(
+                "Could not open '{}': {err} - has this game been downloaded to '{source}'?",
+                final_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let xvd = XvdFile::parse(&mut file).await.expect("no err");
+    let xvd = match XvdFile::parse(&mut file).await {
+        Ok(xvd) => xvd,
+        Err(err) => {
+            eprintln!("Could not parse '{}': {err}", final_path.display());
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let files = xvd.parse_user_package_files(&mut file).await.expect("ok");
+    let files = match xvd.parse_user_package_files(&mut file).await {
+        Ok(files) => files,
+        Err(err) => {
+            eprintln!(
+                "Could not read package files from '{}': {err}",
+                final_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
     for (k, v) in &files {
         if k == "SegmentMetadata.bin" {
-            let sfiles = xvd.parse_segment_metadata(&mut file, v).await.expect("ok");
+            let sfiles = match xvd.parse_segment_metadata(&mut file, v).await {
+                Ok(sfiles) => sfiles,
+                Err(err) => {
+                    eprintln!("Could not parse segment metadata: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
             lfiles = sfiles;
         }
     }
 
     // Classic files
     if lfiles.is_empty() {
-        let sfiles = xvd
-            .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
-            .await
-            .expect("ok");
+        // Always false here: this branch only runs when lfiles.is_empty() (see the
+        // `if` above), and nothing mutates lfiles between that check and this call.
+        let sfiles = match xvd.parse_ntfs_segment_metadata(&mut file, false).await {
+            Ok(sfiles) => sfiles,
+            Err(err) => {
+                eprintln!("Could not parse NTFS segment metadata: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
         for (n, sfile) in &sfiles {
             if sfile.length.div_ceil(PAGE_SIZE as u64) as usize != sfile.data_hashs.len() {
                 println!("{}: {} {}", n, sfile.offset, sfile.length);
@@ -237,11 +274,17 @@ pub async fn run(
         return ExitCode::FAILURE;
     };
 
-    let mut wn = Command::new(wine)
+    let mut wn = match Command::new(&wine)
         .arg(nt_entry)
         .env("WINE_DLL_FILE_MAP", env_value)
         .spawn()
-        .unwrap();
+    {
+        Ok(child) => child,
+        Err(err) => {
+            eprintln!("Could not run '{wine}': {err}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let pid = wn.id().unwrap();
 
