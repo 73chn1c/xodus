@@ -123,7 +123,7 @@ pub async fn run(
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
     let out: &Path = Path::new(&source);
-    let out_absolute = match std::fs::canonicalize(out) {
+    let out_absolute = match tokio::fs::canonicalize(out).await {
         Ok(path) => path,
         Err(err) => {
             eprintln!("Could not resolve '{source}': {err}");
@@ -176,10 +176,9 @@ pub async fn run(
 
     // Classic files
     if lfiles.is_empty() {
-        let sfiles = match xvd
-            .parse_ntfs_segment_metadata(&mut file, !lfiles.is_empty())
-            .await
-        {
+        // Always false here: this branch only runs when lfiles.is_empty() (see the
+        // `if` above), and nothing mutates lfiles between that check and this call.
+        let sfiles = match xvd.parse_ntfs_segment_metadata(&mut file, false).await {
             Ok(sfiles) => sfiles,
             Err(err) => {
                 eprintln!("Could not parse NTFS segment metadata: {err}");
