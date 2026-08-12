@@ -12,11 +12,21 @@ mod utils;
 
 pub const XML_HEADER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>"#;
 
+#[derive(Debug, thiserror::Error)]
+pub enum LoginDeviceCredentialError {
+    #[error("device-add request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("could not serialize the device-add request: {0}")]
+    Serialize(#[from] quick_xml::SeError),
+    #[error("could not parse the device-add response: {0}")]
+    Deserialize(#[from] quick_xml::DeError),
+}
+
 pub async fn login_device_credential(
     client: &reqwest::Client,
     data: DeviceAddRequest,
-) -> reqwest::Result<DeviceAddResponse> {
-    let data = quick_xml::se::to_string(&data).unwrap();
+) -> Result<DeviceAddResponse, LoginDeviceCredentialError> {
+    let data = quick_xml::se::to_string(&data)?;
 
     let response = client
         .post("https://login.live.com/ppsecure/deviceaddcredential.srf")
@@ -27,8 +37,25 @@ pub async fn login_device_credential(
         .send()
         .await?;
     let text = response.text().await?;
-    let resp: DeviceAddResponse = quick_xml::de::from_str(&text).expect("Failed to de xml");
+    let resp: DeviceAddResponse = quick_xml::de::from_str(&text)?;
     Ok(resp)
+}
+
+#[cfg(test)]
+mod login_device_credential_tests {
+    use super::DeviceAddResponse;
+
+    #[test]
+    fn an_unexpected_response_body_is_a_clean_deserialize_error_not_a_panic() {
+        let err = quick_xml::de::from_str::<DeviceAddResponse>(
+            "<html><body>Service Unavailable</body></html>",
+        )
+        .expect_err("this isn't a DeviceAddResponse");
+
+        // just proving this is an ordinary Result, not a panic - the specific
+        // message isn't load-bearing.
+        let _ = err.to_string();
+    }
 }
 
 pub async fn authenticate_device(

@@ -12,7 +12,7 @@ use crate::tokens::store::TokenStoreError;
 #[derive(Debug, Error)]
 pub enum DeviceCredentialError {
     #[error("could not provision a new device: {0}")]
-    Provision(#[from] reqwest::Error),
+    Provision(#[from] crate::api::live::LoginDeviceCredentialError),
     #[error("could not authenticate the device: {0}")]
     Authenticate(#[from] crate::api::live::rst::RSTError),
     #[error("could not parse the device's SPLicense: {0}")]
