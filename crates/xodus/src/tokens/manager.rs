@@ -136,11 +136,16 @@ impl TokenManager {
         self.cache_xsts_response(relying_party, token);
     }
 
+    /// Cached entries are evicted this long before their actual expiry, so a
+    /// cache hit is never so close to expiring that it could go stale between
+    /// being read here and actually being used by the caller.
+    const XSTS_CACHE_EXPIRY_MARGIN: chrono::Duration = chrono::Duration::seconds(60);
+
     fn cache_xsts_response(&self, key: &str, token: &XstsResponse) {
         let Ok(bytes) = serde_json::to_vec(token) else {
             return;
         };
-        let remaining = (token.not_after - chrono::Utc::now())
+        let remaining = (token.not_after - chrono::Utc::now() - Self::XSTS_CACHE_EXPIRY_MARGIN)
             .to_std()
             .unwrap_or(std::time::Duration::ZERO);
         let _ = self
@@ -176,5 +181,35 @@ impl TokenManager {
         };
         tokens.insert(address, token);
         backend.set(key, &serde_json::to_vec(&TokenStore { tokens })?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xsts_expiring_in(seconds: i64) -> XstsResponse {
+        let not_after = (chrono::Utc::now() + chrono::Duration::seconds(seconds))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        serde_json::from_str(&format!(
+            r#"{{"NotAfter":"{not_after}","Token":"t","DisplayClaims":{{"xui":[{{"uhs":"h"}}]}}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_token_expiring_within_the_safety_margin_is_treated_as_already_expired() {
+        let tokens = TokenManager::with_memory();
+        tokens.cache_xsts("rp", &xsts_expiring_in(30));
+
+        assert!(tokens.get_cached_xsts("rp").is_none());
+    }
+
+    #[test]
+    fn a_token_expiring_well_past_the_safety_margin_is_still_cached() {
+        let tokens = TokenManager::with_memory();
+        tokens.cache_xsts("rp", &xsts_expiring_in(300));
+
+        assert!(tokens.get_cached_xsts("rp").is_some());
     }
 }
