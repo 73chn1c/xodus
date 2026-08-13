@@ -913,6 +913,43 @@ impl XvdFile {
         Ok(())
     }
 
+    async fn write_all_with_bounded_retry<Writer: AsyncWrite + Unpin>(
+        out: &mut Writer,
+        mut buf: &[u8],
+    ) -> io::Result<()> {
+        const MAX_RETRIES: u32 = 10;
+        let mut retries = 0;
+        while !buf.is_empty() {
+            match out.write(buf).await {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write returned 0 bytes",
+                    ));
+                }
+                // Only the unwritten remainder is retried - write_all's own
+                // retry loop resent the whole page from byte 0 after a
+                // partial write, corrupting the output with duplicate bytes.
+                Ok(n) => {
+                    buf = &buf[n..];
+                    retries = 0;
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    retries += 1;
+                    if retries > MAX_RETRIES {
+                        // Bounded: ENOSPC/EROFS never recover on their own,
+                        // and the original loop retried forever.
+                        return Err(err);
+                    }
+                    eprintln!("Error writing file: {err} (retry {retries}/{MAX_RETRIES} in 30s)");
+                    sleep(tokio::time::Duration::from_secs(30)).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn extract_file_ex<Writer, Reader, Progress>(
         &self,
         i: &mut Reader,
@@ -1006,11 +1043,7 @@ impl XvdFile {
             } else {
                 to_write
             };
-            while let Err(err) = out.write_all(&page[..to_write]).await {
-                eprintln!("Error write file {} waiting 30s", err);
-                println!("Error write file {} waiting 30s", err);
-                sleep(tokio::time::Duration::from_secs(30)).await;
-            }
+            Self::write_all_with_bounded_retry(out, &page[..to_write]).await?;
         }
         Ok(())
     }
@@ -1050,5 +1083,84 @@ impl XvdFile {
     {
         self.extract_file_ex(i, out, sfile, full_key, progress, true)
             .await
+    }
+}
+
+#[cfg(test)]
+mod bughunt_tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use tokio::io::AsyncWrite;
+
+    use super::XvdFile;
+
+    /// Fails its first `fail_remaining` writes, then accepts at most
+    /// `max_chunk` bytes per call (simulating a short/partial write).
+    struct FlakyWriter {
+        fail_remaining: usize,
+        accepted: Vec<u8>,
+        max_chunk: usize,
+    }
+
+    impl AsyncWrite for FlakyWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.fail_remaining > 0 {
+                self.fail_remaining -= 1;
+                return Poll::Ready(Err(std::io::Error::other("simulated write failure")));
+            }
+            let n = buf.len().min(self.max_chunk);
+            self.accepted.extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_writes_are_resumed_not_restarted_from_zero() {
+        tokio::time::pause();
+        // 2 failures (retried after the paused clock auto-advances past the
+        // 30s backoff) then only 3 bytes accepted per call. The old
+        // `write_all`-based loop resent the whole buffer from byte 0 after
+        // any partial write, so a bug here would duplicate/corrupt output.
+        let mut w = FlakyWriter {
+            fail_remaining: 2,
+            accepted: vec![],
+            max_chunk: 3,
+        };
+        let data = b"0123456789";
+        XvdFile::write_all_with_bounded_retry(&mut w, data)
+            .await
+            .expect("must eventually succeed once the writer starts accepting bytes");
+        assert_eq!(
+            w.accepted, data,
+            "output must match input exactly - no duplicated or dropped bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_write_failure_gives_up_instead_of_retrying_forever() {
+        tokio::time::pause();
+        let mut w = FlakyWriter {
+            fail_remaining: usize::MAX,
+            accepted: vec![],
+            max_chunk: 4096,
+        };
+        let res = XvdFile::write_all_with_bounded_retry(&mut w, b"hello").await;
+        assert!(
+            res.is_err(),
+            "a permanent error (e.g. ENOSPC/EROFS) must eventually surface, not hang forever"
+        );
     }
 }
