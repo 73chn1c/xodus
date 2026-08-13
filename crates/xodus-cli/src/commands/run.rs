@@ -273,9 +273,18 @@ pub async fn run(
         eprintln!("Could not find .exe");
         return ExitCode::FAILURE;
     };
+    // wine's own argv parser expects a normal Win32 path (e.g. "Z:\..."), not
+    // the NT-namespace "\??\Z:..." form used by WINE_DLL_FILE_MAP entries -
+    // passing the NT form as the target argument makes wine fail to resolve
+    // it (ShellExecuteEx "file not found"), even though the same string is
+    // exactly right in the env var above.
+    let wine_target = nt_entry
+        .strip_prefix(r"\??\")
+        .unwrap_or(&nt_entry)
+        .to_string();
 
     let mut wn = match Command::new(&wine)
-        .arg(nt_entry)
+        .arg(wine_target)
         .env("WINE_DLL_FILE_MAP", env_value)
         .spawn()
     {

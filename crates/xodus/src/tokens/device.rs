@@ -150,9 +150,10 @@ mod tests {
         let persistent = std::sync::Arc::new(MemoryBackend::default());
         // Corrupt, non-JSON bytes: get_device_license() will hit a Serde error,
         // not TokenStoreError::NotFound. This must NOT be treated the same as
-        // "no device license yet" - that would attempt to provision a brand new
-        // device over the network on every transient storage hiccup, which can
-        // burn through the account's device registration limit.
+        // "no device license yet" - that would silently discard the stored
+        // credential and provision a brand new device over the network on
+        // every transient storage hiccup, losing the device identity that
+        // licenses are bound to.
         persistent.set("dev_license", b"not valid json").unwrap();
         let tokens = TokenManager::new(persistent, std::sync::Arc::new(MemoryBackend::default()));
 
