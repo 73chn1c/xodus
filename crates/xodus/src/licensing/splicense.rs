@@ -257,7 +257,12 @@ impl SPLicense {
                     .chunks_exact(2)
                     .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect();
-                let mut s = String::from_utf16(&utf16).unwrap();
+                let mut s = String::from_utf16(&utf16).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PackageFullName block is not valid UTF-16",
+                    )
+                })?;
                 if s.ends_with('\0') {
                     s.pop();
                 }
@@ -272,7 +277,15 @@ impl SPLicense {
                     let _key_len = read_u16(&mut reader)? as usize;
 
                     let key_id = read_uuid(&mut reader)?;
-                    let _unknown = read_vec(&mut reader, id_len - 16)?;
+                    let unknown_len = id_len.checked_sub(16).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "PackedContentKeys id_len {id_len} is smaller than the 16-byte key_id it must contain"
+                            ),
+                        )
+                    })?;
+                    let _unknown = read_vec(&mut reader, unknown_len)?;
                     let key = PackedContentKey(read_array(&mut reader)?);
 
                     self.content_keys.insert(key_id, key);
@@ -456,5 +469,61 @@ impl Deref for ContentKey {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod bughunt_tests {
+    use super::SPLicense;
+
+    fn blob(blocks: Vec<(u32, Vec<u8>)>) -> Vec<u8> {
+        let mut out = vec![0u8; 8]; // 4-byte header + 4-byte offset
+        for (id, payload) in blocks {
+            out.extend_from_slice(&id.to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+            out.extend_from_slice(&payload);
+        }
+        out
+    }
+
+    #[test]
+    fn packed_content_keys_with_id_len_below_16() {
+        // `read_vec(&mut reader, id_len - 16)` with id_len = 8
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&8u16.to_le_bytes()); // id_len
+        payload.extend_from_slice(&40u16.to_le_bytes()); // key_len
+        payload.extend_from_slice(&[0u8; 16]); // key_id
+        payload.extend_from_slice(&[0u8; 40]); // key
+        let data = blob(vec![(0xca, payload)]);
+
+        let res = SPLicense::decode(std::io::Cursor::new(data));
+        assert!(
+            res.is_err(),
+            "id_len < 16 must be a clean parse error, not a panic/wraparound"
+        );
+    }
+
+    #[test]
+    fn signature_block_shorter_than_4_bytes() {
+        // `read_vec(&mut reader, size - 4)` with size = 2
+        let data = blob(vec![(0xcc, vec![0u8, 0u8])]);
+        let res = SPLicense::decode(std::io::Cursor::new(data));
+        // Confirmed non-issue: the reader hits EOF before `size - 4` underflows,
+        // and read_exact's EOF surfaces as a clean Err, not a panic.
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn package_full_name_with_invalid_utf16() {
+        // unpaired high surrogate -> String::from_utf16(..).unwrap()
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0xD800u16.to_le_bytes());
+        payload.extend_from_slice(&0x0041u16.to_le_bytes());
+        let data = blob(vec![(0xce, payload)]);
+        let res = SPLicense::decode(std::io::Cursor::new(data));
+        assert!(
+            res.is_err(),
+            "invalid UTF-16 in PackageFullName must be a clean parse error, not a panic"
+        );
     }
 }
