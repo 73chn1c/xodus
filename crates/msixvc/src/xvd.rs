@@ -533,11 +533,29 @@ impl XvdFile {
                 {
                     break;
                 }
-                let end = page_offset as usize - segment_page_start as usize
-                    + segment.filesize.div_ceil(PAGE_SIZE as u64) as usize;
-                let data_hashs: Vec<[u8; 20]> = section.data_hashs
-                    [page_offset as usize - segment_page_start as usize..end]
-                    .into();
+                let start = (page_offset as usize)
+                    .checked_sub(segment_page_start as usize)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidData,
+                            format!(
+                                "segment page offset before section start: {file_name} ({page_offset})"
+                            ),
+                        )
+                    })?;
+                let page_count = segment.filesize.div_ceil(PAGE_SIZE as u64) as usize;
+                let end = start + page_count;
+                if end > section.data_hashs.len() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!(
+                            "missing data hashes for {file_name}: need [{start}..{end}], have {}",
+                            section.data_hashs.len()
+                        ),
+                    )
+                    .into());
+                }
+                let data_hashs: Vec<[u8; 20]> = section.data_hashs[start..end].into();
                 files.insert(
                     file_name,
                     SegmentFile {
