@@ -1,4 +1,4 @@
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use xodus::models::live::ExchangeUserTokenOutcome;
 use xodus::models::secrets::Token;
 use xodus::models::soap;
@@ -8,8 +8,8 @@ use xodus::proto::xodus::XodusMessageType;
 use crate::XML_MAGIC;
 use crate::simple_context::SimpleContext;
 
-pub async fn handle(
-    socket: &mut tokio::net::UnixStream,
+pub async fn handle<S: AsyncRead + AsyncWrite + Unpin>(
+    socket: &mut S,
     context: &mut SimpleContext,
 ) -> tokio::io::Result<()> {
     log::debug!("Parsing XML");
