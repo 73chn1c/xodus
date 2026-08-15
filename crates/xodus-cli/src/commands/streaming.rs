@@ -6,10 +6,11 @@ use std::vec;
 use fs2::available_space;
 use futures_util::{StreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use msixvc::models::xvd::PAGE_SIZE;
 use msixvc::streaming;
 use msixvc::xvd::{SegmentFile, XvdFile};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncSeekExt};
 use tokio::sync::mpsc::{Receiver, Sender};
 use uuid::Uuid;
 use xodus::tokens::TokenManager;
@@ -164,6 +165,7 @@ where
 
         total_progess.set_message("Initializing");
         let mut bars: HashMap<usize, ProgressBar> = HashMap::new();
+        let mut last_print = std::time::Instant::now();
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -180,6 +182,19 @@ where
                         bar.inc(delta);
                     }
                     total_progess.inc(delta);
+
+                    let elapsed = last_print.elapsed();
+                    if elapsed.as_millis() > 200 {
+                        let pos = total_progess.position();
+                        let len = total_progess.length().unwrap_or(pos.max(1));
+                        let percent = (pos as f64 / len as f64 * 100.0) as u8;
+                        
+                        let bytes_per_sec = (total_progess.position() as f64 / total_progess.elapsed().as_secs_f64()) as u64;
+
+                        // Print raw progress for Heroic's non-TTY parser with speed
+                        println!("HEROIC_PROGRESS {}/{} {}% {}", pos, len, percent, bytes_per_sec);
+                        last_print = std::time::Instant::now();
+                    }
                 }
                 ProgressEvent::Finished { id } => {
                     if let Some(bar) = bars.remove(&id) {
@@ -364,27 +379,59 @@ where
     .ok();
 
     let remote_xvd_ref = &remote_xvd;
-    stream::iter(
-        rfiles
-            .iter()
-            .filter(|(k, v1)| {
-                if let Some(v2) = lfiles.get(*k) {
-                    v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
-                } else {
-                    true
-                }
+    let jobs: Vec<Job> = rfiles
+        .iter()
+        .filter(|(k, v1)| {
+            if let Some(v2) = lfiles.get(*k) {
+                v1.data_hashs != v2.data_hashs || v1.data_hashs.is_empty()
+            } else {
+                true
+            }
+        })
+        .map(|(n, v)| Job {
+            name: n.clone(),
+            content: SegmentFile {
+                offset: v.offset,
+                length: v.length,
+                data_hashs: vec![],
+                keep_encrypted: v.keep_encrypted,
+            },
+        })
+        .collect();
+
+    // Resume progress reporting, upfront rather than trickling in: without
+    // this, the aggregate percentage only catches up to bytes already on
+    // disk as each file gets its turn in the `parallel` concurrency window
+    // below, which for a title with hundreds/thousands of small files can
+    // take a very real amount of wall-clock time even though no actual
+    // network transfer is happening - all it's waiting on is scheduling,
+    // not bandwidth. A single upfront synchronous stat() pass over every
+    // job's target file costs milliseconds even for a huge file count, so
+    // do that once here and seed the whole resumed total in one shot
+    // instead of relying on the per-job catch-up event added below (which
+    // still exists as a fallback/for the URL source in `run_cli_reader`'s
+    // resume math, but no longer bears the up-front cost for large titles).
+    if url.strip_prefix("file://").is_none() {
+        let mut already_have: u64 = 0;
+        for job in &jobs {
+            let target_file = out.join(job.name.replace("\\", "/"));
+            if let Ok(meta) = std::fs::metadata(&target_file) {
+                let full_pages = meta.len() / PAGE_SIZE as u64;
+                let safe_pages = full_pages.saturating_sub(1);
+                already_have += (safe_pages * PAGE_SIZE as u64).min(job.content.length);
+            }
+        }
+        if already_have > 0 {
+            tx.send(ProgressEvent::Advanced {
+                id: usize::MAX - 1,
+                delta: already_have
             })
-            .map(|(n, v)| Job {
-                name: n.clone(),
-                content: SegmentFile {
-                    offset: v.offset,
-                    length: v.length,
-                    data_hashs: vec![],
-                    keep_encrypted: v.keep_encrypted,
-                },
-            })
-            .enumerate(),
-    )
+            .await
+            .ok();
+        }
+    }
+
+    stream::iter(jobs.into_iter().enumerate())
     .for_each_concurrent(parallel.unwrap_or(4), |(id, job)| {
         let tx = tx.clone();
         let client = client.clone();
@@ -393,14 +440,60 @@ where
             if let Some(folder) = target_file.parent() {
                 std::fs::create_dir_all(folder).expect("ok");
             }
+            let is_local_source = url.strip_prefix("file://").is_some();
+
+            // Resume support (HTTP source only - see below): if a previous
+            // attempt already wrote part of this file (retry after a
+            // crash/network drop, or a fresh process picking up where an
+            // earlier one left off), reuse those bytes instead of
+            // re-downloading from zero. Only a same-URL/same-package resume
+            // is safe - a different game version at the same path would
+            // silently produce a corrupt file, so this is intentionally a
+            // dumb "trust the existing size" check with no independent
+            // integrity verification of the already-written bytes;
+            // `download_file_http` itself still rounds down to the last
+            // whole page before trusting it. Must match the page rounding
+            // it applies internally - an unaligned seek here would put the
+            // output position out of sync with where the page-encrypted
+            // write loop actually starts writing, silently corrupting the
+            // file - so this rounds down the same way.
+            let resume_bytes = if is_local_source {
+                0 // extract_file always reads its local source from the
+                  // start, so resuming the output independently would
+                  // desync write position from read position - not safe.
+            } else {
+                let existing_len = tokio::fs::metadata(&target_file)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                // Trust everything except the last whole page. A kill -9
+                // (or Heroic's own abort-on-quit) can only ever leave
+                // already-completed write() calls on disk - the OS finishes
+                // those independently of the killed process, so a page
+                // reported as written is genuinely written. A real power
+                // loss / kernel panic is different: the very last in-flight
+                // page can be a torn write (file length says it's there,
+                // but the physical bytes are partial/garbage). Re-fetching
+                // one extra page costs at most ~4KB of bandwidth and turns
+                // that into a non-issue.
+                let full_pages = existing_len / PAGE_SIZE as u64;
+                let safe_pages = full_pages.saturating_sub(1);
+                safe_pages * PAGE_SIZE as u64
+            };
             let mut fout = OpenOptions::new()
                 .create(true)
                 .write(true)
-                .truncate(true)
-                .open(target_file)
+                .truncate(resume_bytes == 0)
+                .open(&target_file)
                 .await
                 .expect("ok");
-            let mut lp = 0;
+            if resume_bytes > 0 {
+                fout
+                    .seek(std::io::SeekFrom::Start(resume_bytes))
+                    .await
+                    .expect("failed to seek to resume position");
+            }
+            let mut lp = resume_bytes.min(job.content.length);
 
             let progress = |pos, _| {
                 if tx
@@ -426,6 +519,12 @@ where
             })
             .await
             .ok();
+            // Note: any already-on-disk bytes for this job were already
+            // credited to the aggregate total up front (see the pre-scan
+            // before this loop starts) - `lp` above already starts at
+            // `resume_bytes` too, so the per-file progress closure only
+            // reports genuinely new bytes from here on. Crediting it again
+            // here would double-count it.
 
             if let Some(fpath) = url.strip_prefix("file://") {
                 let mut i = File::open(&fpath).await.unwrap();
@@ -436,7 +535,15 @@ where
                 tx.send(ProgressEvent::Finished { id }).await.ok();
             } else {
                 remote_xvd_ref
-                    .download_file_http(&client, url, &mut fout, &job.content, *full_key, progress)
+                    .download_file_http(
+                        &client,
+                        url,
+                        &mut fout,
+                        &job.content,
+                        *full_key,
+                        progress,
+                        resume_bytes
+                    )
                     .await
                     .expect("msg");
                 tx.send(ProgressEvent::Finished { id }).await.ok();

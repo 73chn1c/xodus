@@ -729,12 +729,30 @@ impl XvdFile {
         sfile: &SegmentFile,
         full_key: [u8; 32],
         mut progress: Progress,
+        resume_from: u64,
     ) -> Result<(), Box<dyn std::error::Error>>
     where
         Writer: AsyncWrite + Unpin,
         Progress: FnMut(u64, u64),
     {
         if sfile.length == 0 {
+            return Ok(());
+        }
+
+        // Resume support: XTS page encryption is independently keyed per
+        // PAGE_SIZE-aligned page (see `page_in_section` used as the tweak's
+        // data unit below), so it's safe to start decoding at any whole-page
+        // boundary rather than always at page 0 of this file. The caller is
+        // responsible for only trusting a `resume_from` that corresponds to
+        // whole pages actually flushed to disk from a previous attempt (see
+        // `resumable_prefix_len` in streaming.rs) - a partially-written last
+        // page must never be trusted here, so this rounds down defensively
+        // regardless of what the caller passes.
+        let resume_pages = resume_from / PAGE_SIZE as u64;
+        let resume_bytes = resume_pages * PAGE_SIZE as u64;
+        if resume_bytes >= sfile.length {
+            // Already fully present on disk from a previous attempt.
+            progress(sfile.length, sfile.length);
             return Ok(());
         }
 
@@ -764,16 +782,16 @@ impl XvdFile {
             // TODO for data integrity we need a section for unencrypted sections...
             file_offset_in_section = sfile.offset;
         }
-        let page_start = file_offset_in_section / PAGE_SIZE as u64;
-        let page_count = sfile.length.div_ceil(PAGE_SIZE as u64);
+        let page_start = file_offset_in_section / PAGE_SIZE as u64 + resume_pages;
+        let page_count = sfile.length.div_ceil(PAGE_SIZE as u64) - resume_pages;
 
         let mut page = [0u8; PAGE_SIZE];
-        let mut remaining = sfile.length;
+        let mut remaining = sfile.length - resume_bytes;
         let mut page_in_section = page_start;
         let page_length = sfile.length.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
         let mut stream = None;
         let mut pending = bytes::BytesMut::new();
-        let mut v: u64 = 0;
+        let mut v: u64 = resume_bytes;
 
         let stall_timeout = tokio::time::Duration::from_secs(5);
         if let Ok(Ok(Ok(response))) = timeout(

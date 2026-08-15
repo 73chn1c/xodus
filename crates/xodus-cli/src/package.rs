@@ -51,11 +51,16 @@ pub async fn get_content_id(
 
     let Some(package) = found_package else {
         if !subprods.is_empty() {
-            let Ok(item) = Select::new("Select files to download", subprods)
-                .with_page_size(30)
-                .prompt()
-            else {
-                return Err(Box::new(std::io::Error::other("Selection failed")));
+            let item = if std::env::var("XODUS_AUTO_SELECT").unwrap_or_else(|_| "1".into()) == "1" {
+                subprods[0].clone()
+            } else {
+                let Ok(selected) = Select::new("Select files to download", subprods)
+                    .with_page_size(30)
+                    .prompt()
+                else {
+                    return Err(Box::new(std::io::Error::other("Selection failed")));
+                };
+                selected
             };
             return Box::pin(get_content_id(client, item, market)).await;
         }
