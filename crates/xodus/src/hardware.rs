@@ -1,8 +1,6 @@
 // Hardware probing utilities
 
 use std::io;
-#[cfg(target_os = "linux")]
-use std::process::{Command, Stdio};
 
 use base64::prelude::*;
 #[cfg(any(target_os = "macos", target_os = "ios", target_family = "windows"))]
@@ -90,7 +88,58 @@ pub fn probe_provision_components() -> Vec<Component> {
 
 #[cfg(target_os = "linux")]
 fn load_smbios_fields(raw: Option<&[u8]>) -> SmbiosFields {
-    raw.map(parse_smbios).unwrap_or_default()
+    let mut fields = raw.map(parse_smbios).unwrap_or_default();
+
+    if fields.version.is_none() {
+        if let Ok(v) = std::fs::read_to_string("/sys/class/dmi/id/product_version") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                fields.version = Some(trimmed.as_bytes().to_vec());
+            }
+        }
+    }
+    if fields.serial.is_none() {
+        if let Ok(s) = std::fs::read_to_string("/sys/class/dmi/id/product_serial") {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                fields.serial = Some(trimmed.as_bytes().to_vec());
+            }
+        }
+    }
+    if fields.uuid.is_none() {
+        if let Ok(u_str) = std::fs::read_to_string("/sys/class/dmi/id/product_uuid") {
+            if let Some(parsed) = parse_uuid_string(u_str.trim()) {
+                fields.uuid = Some(parsed);
+            }
+        }
+        if fields.uuid.is_none() {
+            if let Ok(mid) = std::fs::read_to_string("/etc/machine-id") {
+                if let Some(parsed) = parse_hex_16(mid.trim()) {
+                    fields.uuid = Some(parsed);
+                }
+            }
+        }
+    }
+
+    fields
+}
+
+#[cfg(target_os = "linux")]
+fn parse_uuid_string(s: &str) -> Option<[u8; 16]> {
+    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    parse_hex_16(&hex)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_hex_16(s: &str) -> Option<[u8; 16]> {
+    if s.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -203,20 +252,8 @@ fn load_raw_smbios() -> io::Result<Vec<u8>> {
 
 #[cfg(target_os = "linux")]
 fn load_raw_smbios() -> io::Result<Vec<u8>> {
-    let cmd = Command::new("pkexec")
-        .args(["cat", "/sys/firmware/dmi/entries/1-0/raw"])
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let output = cmd.wait_with_output()?;
-
-    if output.status.success() {
-        Ok(output.stdout)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "unable to probe SMBIOS data",
-        ))
-    }
+    // Read directly if accessible; never invoke pkexec/sudo to prevent popups or blocking
+    std::fs::read("/sys/firmware/dmi/entries/1-0/raw")
 }
 
 #[cfg(not(any(
@@ -273,7 +310,6 @@ mod tests {
 
     #[test]
     fn an_empty_blob_yields_no_fields() {
-        // `pkexec cat` can exit 0 having written nothing.
         assert_eq!(parse_smbios(&[]), SmbiosFields::default());
     }
 
@@ -331,5 +367,26 @@ mod tests {
         let fields = parse_smbios(&structure);
         assert_eq!(fields.version.as_deref(), Some(&b"1.0"[..]));
         assert_eq!(fields.serial, None);
+    }
+
+    #[test]
+    fn parses_valid_uuid_and_hex_strings() {
+        use super::{parse_hex_16, parse_uuid_string};
+        assert_eq!(
+            parse_uuid_string("c3c86121-a1bf-4b2a-b0d7-2ebcb38dc2a8"),
+            Some([
+                0xc3, 0xc8, 0x61, 0x21, 0xa1, 0xbf, 0x4b, 0x2a, 0xb0, 0xd7, 0x2e, 0xbc, 0xb3,
+                0x8d, 0xc2, 0xa8
+            ])
+        );
+        assert_eq!(
+            parse_hex_16("0123456789abcdef0123456789abcdef"),
+            Some([
+                0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+                0xab, 0xcd, 0xef
+            ])
+        );
+        assert_eq!(parse_hex_16("short"), None);
+        assert_eq!(parse_hex_16("invalid-hex-characters-here-!!!!"), None);
     }
 }
