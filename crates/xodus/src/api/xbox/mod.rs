@@ -7,12 +7,28 @@ pub mod auth;
 pub mod title;
 pub use auth::{authenticate_xbox_user, get_xsts_auth_header, request_xsts_token};
 
+#[derive(thiserror::Error, Debug)]
+pub enum XboxAuthError {
+    #[error("Failed to exchange MS user token: {0}")]
+    ExchangeUserToken(String),
+    #[error("MS user token exchange returned a fault")]
+    TokenExchangeFault,
+    #[error("Expected RequestSecurityTokenResponse but token collection was empty")]
+    EmptyTokenCollection,
+    #[error("Unsupported token type, expected Compact token")]
+    UnsupportedTokenType,
+    #[error("Failed to authenticate Xbox user: {0}")]
+    XboxUserAuth(#[from] reqwest::Error),
+    #[error("Failed to obtain XSTS token: {0}")]
+    XstsRequest(String),
+}
+
 pub async fn run(
     client: &reqwest::Client,
     dev_token: LegacyToken,
     legacy: LegacyToken,
     relying_party: &str,
-) -> XstsResponse {
+) -> Result<XstsResponse, XboxAuthError> {
     let user_token = crate::api::live::exchange_user_token(
         client,
         legacy,
@@ -27,33 +43,34 @@ pub async fn run(
         )],
     )
     .await
-    .expect("Failed to get ms user token");
+    .map_err(|e| XboxAuthError::ExchangeUserToken(e.to_string()))?;
 
     let user_token: Token = match user_token {
         ExchangeUserTokenOutcome::Fault(_) => {
-            eprintln!("Failed to get exchange MS token");
-            panic!("TODO");
+            return Err(XboxAuthError::TokenExchangeFault);
         }
         ExchangeUserTokenOutcome::Issued(
             soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
         ) => {
+            if collection.security_tokens.is_empty() {
+                return Err(XboxAuthError::EmptyTokenCollection);
+            }
             let token = collection.security_tokens.remove(0);
             token.into()
         }
         ExchangeUserTokenOutcome::Issued(soap::BodyContent::RequestSecurityTokenResponse(
             token,
         )) => (*token).into(),
-        _ => unreachable!("Only responses are handled"),
+        _ => return Err(XboxAuthError::UnsupportedTokenType),
     };
     let Token::Compact(user_token) = user_token else {
-        eprintln!("Unsupported token");
-        panic!("TODO");
+        return Err(XboxAuthError::UnsupportedTokenType);
     };
     let resp = authenticate_xbox_user(client, user_token)
         .await
-        .expect("Failed to authenticate Xbox user");
+        .map_err(XboxAuthError::XboxUserAuth)?;
 
     request_xsts_token(client, resp.token, relying_party)
         .await
-        .expect("Failed to authenticate Xbox user")
+        .map_err(|e| XboxAuthError::XstsRequest(e.to_string()))
 }

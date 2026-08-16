@@ -54,7 +54,13 @@ pub async fn run(
         return ExitCode::FAILURE;
     };
 
-    let xsts = xodus::api::xbox::run(client, dev_token, legacy, "http://xboxlive.com").await;
+    let xsts = match xodus::api::xbox::run(client, dev_token, legacy, "http://xboxlive.com").await {
+        Ok(xsts) => xsts,
+        Err(err) => {
+            eprintln!("Failed to authenticate with Xbox Live: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let Some(xid) = xsts.xid().map(|xid| xid.to_string()) else {
         eprintln!("Could not determine xuid from token");
         return ExitCode::FAILURE;
