@@ -113,16 +113,125 @@ pub fn decrypt_soap_encrypted_data<T: serde::de::DeserializeOwned>(
     let key = signature.hmac_key(&nonce).ok_or(rst::RSTError::HmacKey)?;
     let cipher_value = BASE64_STANDARD.decode(encrypted_data.cipher_data.cipher_value)?;
 
+    if cipher_value.len() < 16 {
+        return Err(rst::RSTError::InvalidEncryptedData(format!(
+            "cipher_value is {} bytes, shorter than the 16-byte IV",
+            cipher_value.len()
+        )));
+    }
     let (iv, encrypted) = cipher_value.split_at(16);
     let iv: &[u8; 16] = iv.try_into().unwrap();
     let decryptor = Aes256CbcDec::new(&key.into(), iv.into());
-    let mut block = [0; 8192];
+    // Ciphertext length is always >= plaintext length for CBC+PKCS7, so this
+    // is a safe upper bound regardless of payload size (no fixed 8192B cap).
+    let mut block = vec![0u8; encrypted.len()];
 
-    decryptor
+    let plaintext = decryptor
         .decrypt_padded_b2b::<Pkcs7>(encrypted, &mut block)
-        .expect("Failed");
-    let result = std::str::from_utf8(&block).unwrap();
+        .map_err(|_| rst::RSTError::InvalidEncryptedData("PKCS7 unpadding failed".to_string()))?;
+    let result = std::str::from_utf8(plaintext).map_err(|_| {
+        rst::RSTError::InvalidEncryptedData("decrypted payload is not valid UTF-8".to_string())
+    })?;
     let data = quick_xml::de::from_str::<T>(result)?;
 
     Ok(data)
+}
+
+#[cfg(test)]
+mod real_fn_tests {
+    use std::collections::HashMap;
+
+    use aes::cipher::block_padding::Pkcs7;
+    use aes::cipher::{BlockModeEncrypt, KeyIvInit};
+    use base64::prelude::*;
+
+    use super::decrypt_soap_encrypted_data;
+    use crate::api::live::rst::RSTSignature;
+    use crate::models::soap;
+
+    type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+
+    const NONCE: [u8; 32] = [3u8; 32];
+    const CLEP_SECRET: [u8; 32] = [11u8; 32];
+
+    /// Builds exactly what the production function expects: an EncryptedData
+    /// whose KeyInfo points at "#SignKey", plus a nonce map keyed "SignKey".
+    fn encrypted_data_for(plaintext: &str) -> Box<soap::EncryptedData> {
+        let sig = RSTSignature::Hmac {
+            clep_secret: &CLEP_SECRET,
+            tpm_secret: &[],
+        };
+        let key = sig.hmac_key(&NONCE).expect("hmac key");
+        let iv = [5u8; 16];
+
+        let mut buf = vec![0u8; plaintext.len() + 32];
+        let ct = Aes256CbcEnc::new(&key.into(), &iv.into())
+            .encrypt_padded_b2b::<Pkcs7>(plaintext.as_bytes(), &mut buf)
+            .expect("encrypt");
+
+        let mut body = iv.to_vec();
+        body.extend_from_slice(ct);
+
+        Box::new(soap::EncryptedData {
+            id: "BinaryDAToken0".to_string(),
+            xmlns: "http://www.w3.org/2001/04/xmlenc#".to_string(),
+            el_type: "http://www.w3.org/2001/04/xmlenc#Element".to_string(),
+            encryption_method: soap::EncryptionMethod::default(),
+            key_info: soap::KeyInfoWrap {
+                ds: None,
+                key_name: None,
+                security_token_reference: Some(soap::SecurityTokenReference {
+                    reference: soap::ReferenceUri {
+                        uri: "#SignKey".to_string(),
+                    },
+                }),
+            },
+            cipher_data: soap::CipherData::new(BASE64_STANDARD.encode(&body)),
+        })
+    }
+
+    fn nonces() -> HashMap<String, String> {
+        HashMap::from([("SignKey".to_string(), BASE64_STANDARD.encode(NONCE))])
+    }
+
+    fn sig() -> RSTSignature<'static> {
+        RSTSignature::Hmac {
+            clep_secret: &CLEP_SECRET,
+            tpm_secret: &[],
+        }
+    }
+
+    /// Control: proves the harness itself is correct, so a panic in the other
+    /// tests is the production code and not my test setup.
+    #[test]
+    fn control_small_payload_round_trips() {
+        let data = encrypted_data_for("<Root><Token>abc</Token></Root>");
+        let out: serde_json::Value =
+            decrypt_soap_encrypted_data(data, &sig(), &nonces()).expect("should decrypt");
+        println!("CONTROL ok -> {out:?}");
+    }
+
+    /// Previously panicked at the fixed 8192-byte buffer; now the buffer is
+    /// sized to the ciphertext, so a >8KiB token round-trips cleanly.
+    #[test]
+    fn payload_larger_than_the_old_8192_cap_round_trips() {
+        let pt = format!("<Root><Token>{}</Token></Root>", "A".repeat(9000));
+        let data = encrypted_data_for(&pt);
+        let _: serde_json::Value = decrypt_soap_encrypted_data(data, &sig(), &nonces())
+            .expect("large payload must decrypt cleanly, not panic");
+    }
+
+    /// Previously panicked in `cipher_value.split_at(16)`; now returns a
+    /// clean `RSTError::InvalidEncryptedData`.
+    #[test]
+    fn cipher_value_shorter_than_the_iv_returns_clean_error() {
+        let mut data = encrypted_data_for("<Root/>");
+        data.cipher_data.cipher_value = BASE64_STANDARD.encode([1u8, 2, 3]);
+        let err = decrypt_soap_encrypted_data::<serde_json::Value>(data, &sig(), &nonces())
+            .expect_err("short cipher_value must be a clean error, not a panic");
+        assert!(matches!(
+            err,
+            crate::api::live::rst::RSTError::InvalidEncryptedData(_)
+        ));
+    }
 }

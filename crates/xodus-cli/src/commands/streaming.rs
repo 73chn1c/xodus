@@ -41,7 +41,7 @@ pub async fn run(
     market: Option<String>,
 ) -> ExitCode {
     let (tx, rx) = tokio::sync::mpsc::channel::<ProgressEvent>(256);
-    if source.starts_with("file://") {
+    let ok = if source.starts_with("file://") {
         let fsrc = source.strip_prefix("file://").unwrap_or_default();
         let f = File::open(fsrc).await.unwrap();
         let l = f.metadata().await.unwrap().len();
@@ -58,7 +58,7 @@ pub async fn run(
             &tx,
             rx,
         )
-        .await;
+        .await
     } else {
         let vurl = if source.starts_with("http://") || source.starts_with("https://") {
             source
@@ -134,10 +134,14 @@ pub async fn run(
             &tx,
             rx,
         )
-        .await;
-    }
+        .await
+    };
 
-    ExitCode::SUCCESS
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
 }
 
 async fn run_cli_reader<Reader>(
@@ -152,7 +156,7 @@ async fn run_cli_reader<Reader>(
     url: &str,
     tx: &Sender<ProgressEvent>,
     mut rx: Receiver<ProgressEvent>,
-) -> ()
+) -> bool
 where
     Reader: AsyncRead + Unpin,
 {
@@ -239,7 +243,7 @@ async fn run_reader<Reader>(
     l: u64,
     url: &str,
     tx: &Sender<ProgressEvent>,
-) -> ()
+) -> bool
 where
     Reader: AsyncRead + Unpin,
 {
@@ -318,7 +322,7 @@ where
     .await;
     if let Err(err) = license {
         eprintln!("{}", err);
-        return;
+        return false;
     }
     let (key, game_splicense) = license.unwrap();
     if game_splicense.content_keys.len() != 1 {
@@ -326,10 +330,11 @@ where
             "unexpected number of content keys {}",
             game_splicense.content_keys.len()
         );
-        return;
+        return false;
     }
     let Some((_, content_key)) = game_splicense.content_keys.into_iter().next() else {
-        return;
+        eprintln!("no content key found in license");
+        return false;
     };
 
     let full_key = content_key.unpack(&key).expect("failed to unpack");
@@ -356,7 +361,7 @@ where
                 out.display(),
                 err
             );
-            return;
+            return false;
         }
     };
 
@@ -368,7 +373,7 @@ where
             available_free_space,
             total_size
         );
-        return;
+        return false;
     }
 
     tx.send(ProgressEvent::UpdateRemaining {
@@ -554,4 +559,5 @@ where
 
     std::fs::remove_file(&final_path).ok();
     std::fs::rename(&cache_path, &final_path).expect("ok");
+    true
 }

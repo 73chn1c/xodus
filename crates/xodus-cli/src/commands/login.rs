@@ -27,7 +27,7 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager) -> ExitCode {
         Some(soap::BodyContent::RequestSecurityTokenResponse(token)) => vec![*token],
         None => {
             eprintln!("Didn't log in");
-            vec![]
+            return ExitCode::FAILURE;
         }
         _ => unreachable!(),
     };

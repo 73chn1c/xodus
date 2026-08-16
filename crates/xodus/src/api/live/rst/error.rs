@@ -19,6 +19,8 @@ pub enum RSTError {
     HmacKey,
     #[error("The signature verification failed - {0}")]
     InvalidResponseSignature(String),
+    #[error("Encrypted response data is malformed - {0}")]
+    InvalidEncryptedData(String),
 }
 
 #[derive(thiserror::Error, Debug)]

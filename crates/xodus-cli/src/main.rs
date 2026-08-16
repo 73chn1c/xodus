@@ -9,6 +9,20 @@ mod manifest;
 mod package;
 mod webview;
 
+/// `for_each_concurrent` treats a limit of 0 as *unlimited*, not "serial" -
+/// reject it here instead of silently running every segment in parallel.
+fn parse_positive_usize(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("`{s}` is not a valid number"))?;
+    if n == 0 {
+        return Err(
+            "--parallel must be at least 1 (0 means unlimited concurrency, not serial)".to_string(),
+        );
+    }
+    Ok(n)
+}
+
 #[derive(Subcommand)]
 enum SubCommand {
     #[command(about = "Download msixvc or xsp files fo given game")]
@@ -72,7 +86,7 @@ enum SubCommand {
             help = "Attempt to skip downloading NTFS metadata to be faste while missing some files"
         )]
         try_skip_ntfs: bool,
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = parse_positive_usize)]
         parallel: Option<usize>,
         #[arg(short, long)]
         market: Option<String>,
