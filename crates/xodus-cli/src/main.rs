@@ -100,6 +100,8 @@ enum SubCommand {
         exe: Option<String>,
         #[arg(short, long)]
         market: Option<String>,
+        #[arg(last = true, help = "Extra arguments to forward to the game executable")]
+        args: Vec<String>,
     },
     #[command(about = "Generate or decrypt base64-encoded CLEP challenge data")]
     Clep {
@@ -223,7 +225,8 @@ async fn main() -> ExitCode {
             wine,
             exe,
             market,
-        } => commands::run::run(&client, &tokens, source, wine, exe, market).await,
+            args,
+        } => commands::run::run(&client, &tokens, source, wine, exe, market, args).await,
         SubCommand::Clep { action } => match action {
             ClepAction::Generate {
                 smbios,

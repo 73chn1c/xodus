@@ -120,6 +120,7 @@ pub async fn run(
     wine: String,
     exe: Option<String>,
     market: Option<String>,
+    args: Vec<String>,
 ) -> ExitCode {
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
@@ -256,12 +257,17 @@ pub async fn run(
 
         let nt_suffix = fd.0.trim_start_matches('\\');
         let win_path = format!("Z:{}\\{}", nt_prefix, nt_suffix);
+        let norm_fd = fd.0.replace("\\", "/").trim_start_matches('/').to_lowercase();
         if let Some(exe) = &exe {
-            if exe == fd.0 {
-                nt_entry = Some(win_path)
+            let norm_exe = exe.replace("\\", "/").trim_start_matches('/').to_lowercase();
+            if norm_exe == norm_fd || norm_fd.ends_with(&norm_exe) {
+                nt_entry = Some(win_path);
             }
-        } else if default_exe.as_deref() == Some(fd.0.as_str()) {
-            nt_entry = Some(win_path)
+        } else if let Some(ref def) = default_exe {
+            let norm_def = def.replace("\\", "/").trim_start_matches('/').to_lowercase();
+            if norm_def == norm_fd || norm_fd.ends_with(&norm_def) {
+                nt_entry = Some(win_path);
+            }
         }
 
         env_value.push_str(&format!("{}:\\??\\Z:{}\\{}", fd.1, nt_prefix, nt_suffix))
@@ -274,6 +280,7 @@ pub async fn run(
 
     let mut wn = Command::new(wine)
         .arg(nt_entry)
+        .args(args)
         .env("WINE_DLL_FILE_MAP", env_value)
         .current_dir(out)
         .spawn()
