@@ -124,14 +124,34 @@ pub async fn run(
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
     let out: &Path = Path::new(&source);
-    let out_absolute = std::fs::canonicalize(out).unwrap();
-    let final_path = out.join(".xodus-streaming.msixvc");
+    let out_absolute = match std::fs::canonicalize(out) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to canonicalize path {}: {}", out.display(), e);
+            return ExitCode::FAILURE;
+        }
+    };
 
-    let mut file = OpenOptions::new()
+    let final_path = if out.join(".xodus-streaming.msixvc").exists() {
+        out.join(".xodus-streaming.msixvc")
+    } else if out.join(".xodus-streaming-tmp.msixvc").exists() {
+        out.join(".xodus-streaming-tmp.msixvc")
+    } else {
+        eprintln!("Error: neither .xodus-streaming.msixvc nor .xodus-streaming-tmp.msixvc found in {}", out.display());
+        return ExitCode::FAILURE;
+    };
+
+    let mut file = match OpenOptions::new()
         .read(true)
         .open(final_path.to_owned())
         .await
-        .unwrap();
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to open {}: {}", final_path.display(), e);
+            return ExitCode::FAILURE;
+        }
+    };
 
     let xvd = XvdFile::parse(&mut file).await.expect("no err");
 
@@ -235,13 +255,13 @@ pub async fn run(
         }
 
         let nt_suffix = fd.0.trim_start_matches('\\');
-        let nt_path = format!("\\??\\Z:{}\\{}", nt_prefix, nt_suffix);
+        let win_path = format!("Z:{}\\{}", nt_prefix, nt_suffix);
         if let Some(exe) = &exe {
             if exe == fd.0 {
-                nt_entry = Some(nt_path)
+                nt_entry = Some(win_path)
             }
         } else if default_exe.as_deref() == Some(fd.0.as_str()) {
-            nt_entry = Some(nt_path)
+            nt_entry = Some(win_path)
         }
 
         env_value.push_str(&format!("{}:\\??\\Z:{}\\{}", fd.1, nt_prefix, nt_suffix))
@@ -255,6 +275,7 @@ pub async fn run(
     let mut wn = Command::new(wine)
         .arg(nt_entry)
         .env("WINE_DLL_FILE_MAP", env_value)
+        .current_dir(out)
         .spawn()
         .unwrap();
 
