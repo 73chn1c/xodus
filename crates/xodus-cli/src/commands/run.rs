@@ -37,11 +37,13 @@ fn find_executable_from_config(game_dir: &Path) -> Result<String, Box<dyn std::e
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(quick_xml::events::Event::Start(e)) => {
+            // <Executable .../> is self-closing (no children), so quick-xml reports it
+            // as Event::Empty, not Event::Start - both need the same attribute scan.
+            Ok(quick_xml::events::Event::Start(e)) | Ok(quick_xml::events::Event::Empty(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 if name == "ExecutableList" {
                     in_executable_list = true;
-                } else if name == "Executable" && in_executable_list {
+                } else if name == "Executable" && in_executable_list && executable_name.is_none() {
                     for attr in e.attributes() {
                         let attr = attr?;
                         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
