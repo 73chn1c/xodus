@@ -18,6 +18,56 @@ use xodus::tokens::TokenManager;
 
 use crate::license::get_license;
 
+fn find_executable_from_config(game_dir: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let mut config_path = game_dir.join("MicrosoftGame.config");
+    if !config_path.exists() {
+        config_path.set_extension("Config");
+        if !config_path.exists() {
+            return Err("MicrosoftGame.config not found".into());
+        }
+    }
+
+    let content = std::fs::read_to_string(&config_path)?;
+    let mut reader = quick_xml::Reader::from_str(&content);
+    reader.config_mut().trim_text(true);
+
+    let mut in_executable_list = false;
+    let mut executable_name = None;
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(quick_xml::events::Event::Start(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                if name == "ExecutableList" {
+                    in_executable_list = true;
+                } else if name == "Executable" && in_executable_list {
+                    for attr in e.attributes() {
+                        let attr = attr?;
+                        let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
+                        if key == "Name" {
+                            executable_name = Some(String::from_utf8_lossy(attr.value.as_ref()).into_owned());
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(quick_xml::events::Event::End(e)) => {
+                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+                if name == "ExecutableList" {
+                    in_executable_list = false;
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Err(e) => return Err(Box::new(e)),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    executable_name.ok_or_else(|| "No executable found in MicrosoftGame.config".into())
+}
+
 #[cfg(target_os = "linux")]
 fn make_temp_file(_folder: &str) -> std::io::Result<std::fs::File> {
     let fd = memfd_create("xodus", MemfdFlags::CLOEXEC).map_err(std::io::Error::from)?;
@@ -212,6 +262,18 @@ pub async fn run(
     let nt_prefix = out_absolute.to_string_lossy().replace("/", "\\");
     let nt_prefix = nt_prefix.trim_end_matches('\\');
 
+    let target_exe = if let Some(exe) = &exe {
+        exe.clone()
+    } else {
+        match find_executable_from_config(&out_absolute) {
+            Ok(exe) => exe,
+            Err(err) => {
+                eprintln!("{}", err);
+                return ExitCode::FAILURE;
+            }
+        }
+    };
+
     let mut nt_entry = None;
 
     for fd in fds {
@@ -221,19 +283,29 @@ pub async fn run(
 
         let nt_suffix = fd.0.trim_start_matches('\\');
         let nt_path = format!("\\??\\Z:{}\\{}", nt_prefix, nt_suffix);
-        if let Some(exe) = &exe {
-            if exe == fd.0 {
-                nt_entry = Some(nt_path)
-            }
-        } else if nt_entry.is_none() {
-            nt_entry = Some(nt_path)
+
+        let fd_basename = Path::new(&fd.0)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        let target_basename = Path::new(&target_exe)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        let matches = target_exe.as_str() == fd.0.as_str()
+            || (!target_basename.is_empty() && target_basename == fd_basename);
+
+        if matches {
+            nt_entry = Some(nt_path);
         }
 
         env_value.push_str(&format!("{}:\\??\\Z:{}\\{}", fd.1, nt_prefix, nt_suffix))
     }
 
     let Some(nt_entry) = nt_entry else {
-        eprintln!("Could not find .exe");
+        eprintln!("Could not find .exe matching '{}'", target_exe);
         return ExitCode::FAILURE;
     };
 
