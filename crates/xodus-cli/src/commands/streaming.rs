@@ -6,7 +6,7 @@ use std::vec;
 use fs2::available_space;
 use futures_util::{StreamExt, stream};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use msixvc::models::xvd::PAGE_SIZE;
+use msixvc::layout::PAGE_SIZE;
 use msixvc::streaming;
 use msixvc::xvd::{SegmentFile, XvdFile};
 use tokio::fs::{File, OpenOptions};
@@ -356,8 +356,7 @@ where
             }
         })
         .map(|(_, v)| v.length)
-        .reduce(|old, c| old + c)
-        .map_or(0, |x| x);
+        .sum();
 
     let required_free_space = total_size;
     let available_free_space = match available_space(out) {
